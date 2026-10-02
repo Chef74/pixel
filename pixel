@@ -1,0 +1,437 @@
+-- ╔══════════════════════════════════════════════════════╗
+-- ║     AXIOM  //  Pixel Conquest / Eroberung            ║
+-- ║     Zynova-Compatible  |  Rayfield UI                ║
+-- ╚══════════════════════════════════════════════════════╝
+
+-- ══════════════════════════════════════════════════════
+--  ZYNOVA COMPAT SHIM
+--  Normalises the http function across executors so the
+--  Rayfield fetch works regardless of engine quirks.
+-- ══════════════════════════════════════════════════════
+local function httpGet(url)
+    -- Try each method in order of executor support
+    local ok, result
+
+    -- Method 1: standard Roblox (no boolean — Zynova dislikes it)
+    ok, result = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and result and result ~= "" then return result end
+
+    -- Method 2: syn.request (Synapse / some forks)
+    if syn and syn.request then
+        ok, result = pcall(function()
+            return syn.request({ Url = url, Method = "GET" }).Body
+        end)
+        if ok and result and result ~= "" then return result end
+    end
+
+    -- Method 3: request() global (KRNL, Fluxus, some Zynova builds)
+    if request then
+        ok, result = pcall(function()
+            return request({ Url = url, Method = "GET" }).Body
+        end)
+        if ok and result and result ~= "" then return result end
+    end
+
+    -- Method 4: http.request (older executor APIs)
+    if http and http.request then
+        ok, result = pcall(function()
+            return http.request({ Url = url, Method = "GET" }).Body
+        end)
+        if ok and result and result ~= "" then return result end
+    end
+
+    error("[Axiom] All HTTP methods failed. Check your executor's HTTP toggle.")
+end
+
+-- ══════════════════════════════════════════════════════
+--  RAYFIELD BOOTSTRAP  (Zynova-safe)
+-- ══════════════════════════════════════════════════════
+local RayfieldSource = httpGet("https://sirius.menu/rayfield")
+assert(RayfieldSource and RayfieldSource ~= "",
+    "[Axiom] Rayfield source came back empty — enable HTTP in Zynova settings.")
+
+local loadOk, Rayfield = pcall(loadstring(RayfieldSource))
+assert(loadOk and Rayfield,
+    "[Axiom] Rayfield failed to initialise: " .. tostring(Rayfield))
+
+-- ══════════════════════════════════════════════════════
+--  SERVICES  (explicit GetService — Zynova sandbox safe)
+-- ══════════════════════════════════════════════════════
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local lp                = Players.LocalPlayer
+
+-- ══════════════════════════════════════════════════════
+--  CONFIG BLOCK  ← edit if auto-detect misses your game
+-- ══════════════════════════════════════════════════════
+local CONFIG = {
+    moneyStatName    = "",   -- e.g. "Money", "Cash", "Gold"
+    materialStatName = "",   -- e.g. "Materials", "Wood", "Resources"
+    nukeStatName     = "",   -- e.g. "Nukes", "Bombs", "Missiles"
+
+    moneyAmount      = 999999999,
+    materialAmount   = 999999999,
+    nukeAmount       = 9999,
+
+    loopInterval     = 0.5,
+
+    nukeRemoteNames  = {
+        "UseNuke","LaunchNuke","FireNuke","DropBomb",
+        "NukeEvent","BombEvent","PlaceNuke","DeployNuke",
+        "Attack","UseAbility","UseBomb","Nuke","Fire",
+    },
+}
+
+-- ══════════════════════════════════════════════════════
+--  WINDOW
+-- ══════════════════════════════════════════════════════
+local Window = Rayfield:CreateWindow({
+    Name            = "Axiom  //  Pixel Conquest",
+    LoadingTitle    = "Axiom Suite",
+    LoadingSubtitle = "scanning conquest engine...",
+    ConfigurationSaving = {
+        Enabled    = true,
+        FolderName = "Axiom",
+        FileName   = "PixelConquest",
+    },
+    KeySystem = false,
+})
+
+-- ══════════════════════════════════════════════════════
+--  AUTO-DETECT LEADERSTATS
+-- ══════════════════════════════════════════════════════
+local moneyKeywords    = {"money","cash","gold","coin","dollar","bucks","credit","balance"}
+local materialKeywords = {"material","wood","stone","iron","resource","ore","lumber","supply","mat"}
+local nukeKeywords     = {"nuke","bomb","missile","rocket","warhead","weapon","explosive","blast"}
+
+local function matchesKeywords(name, keywords)
+    local lower = name:lower()
+    for _, kw in ipairs(keywords) do
+        if lower:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function findStat(keywords, override)
+    local ls = lp:FindFirstChild("leaderstats")
+    if not ls then return nil end
+    if override and override ~= "" then
+        return ls:FindFirstChild(override)
+    end
+    for _, obj in ipairs(ls:GetChildren()) do
+        if (obj:IsA("NumberValue") or obj:IsA("IntValue"))
+           and matchesKeywords(obj.Name, keywords) then
+            return obj
+        end
+    end
+    return nil
+end
+
+local statMoney, statMaterial, statNuke
+
+local function refreshStats()
+    statMoney    = findStat(moneyKeywords,    CONFIG.moneyStatName)
+    statMaterial = findStat(materialKeywords, CONFIG.materialStatName)
+    statNuke     = findStat(nukeKeywords,     CONFIG.nukeStatName)
+end
+
+-- Wait for leaderstats then scan
+task.spawn(function()
+    local deadline = tick() + 15
+    while not lp:FindFirstChild("leaderstats") and tick() < deadline do
+        task.wait(0.4)
+    end
+    refreshStats()
+end)
+
+lp.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    refreshStats()
+end)
+
+-- ══════════════════════════════════════════════════════
+--  RESOURCE SETTER  (pcall-wrapped for Zynova sandbox)
+-- ══════════════════════════════════════════════════════
+local loopFlags = { money = false, material = false, nuke = false }
+
+local function setStat(stat, amount)
+    if not stat or not stat.Parent then return end
+    pcall(function() stat.Value = amount end)
+end
+
+-- Heartbeat loop — uses explicit service ref, not shorthand
+RunService.Heartbeat:Connect(function()
+    if loopFlags.money    then setStat(statMoney,    CONFIG.moneyAmount)    end
+    if loopFlags.material then setStat(statMaterial, CONFIG.materialAmount) end
+    if loopFlags.nuke     then setStat(statNuke,     CONFIG.nukeAmount)     end
+end)
+
+-- ══════════════════════════════════════════════════════
+--  REMOTE UTILS
+-- ══════════════════════════════════════════════════════
+local function deepFind(root, nameList)
+    for _, name in ipairs(nameList) do
+        local r = root:FindFirstChild(name, true)
+        if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
+            return r
+        end
+    end
+    return nil
+end
+
+local function findNukeRemote()
+    return deepFind(ReplicatedStorage, CONFIG.nukeRemoteNames)
+        or deepFind(workspace,         CONFIG.nukeRemoteNames)
+end
+
+local function fireRemote(remote)
+    pcall(function()
+        if remote:IsA("RemoteEvent") then
+            remote:FireServer()
+        else
+            remote:InvokeServer()
+        end
+    end)
+end
+
+local function listAllRemotes()
+    local lines = {}
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+            table.insert(lines, obj.Name .. "  [" .. obj.ClassName .. "]")
+        end
+    end
+    return #lines > 0 and table.concat(lines, "\n") or "No remotes in ReplicatedStorage."
+end
+
+-- ══════════════════════════════════════════════════════
+--  TAB 1  ·  MONEY
+-- ══════════════════════════════════════════════════════
+local MoneyTab = Window:CreateTab("💰  Money", 4483362458)
+MoneyTab:CreateSection("Unlimited Money")
+
+MoneyTab:CreateToggle({
+    Name         = "Infinite Money Loop",
+    CurrentValue = false,
+    Flag         = "InfMoney",
+    Callback     = function(val)
+        loopFlags.money = val
+        if val then setStat(statMoney, CONFIG.moneyAmount) end
+    end,
+})
+
+MoneyTab:CreateButton({
+    Name = "Set Money Once",
+    Callback = function()
+        refreshStats()
+        setStat(statMoney, CONFIG.moneyAmount)
+        Rayfield:Notify({
+            Title   = "Axiom",
+            Content = "Money → " .. tostring(CONFIG.moneyAmount),
+            Duration= 3, Image = 4483362458,
+        })
+    end,
+})
+
+MoneyTab:CreateSlider({
+    Name         = "Money Amount (millions)",
+    Range        = {1, 999},
+    Increment    = 1,
+    Suffix       = "M",
+    CurrentValue = 999,
+    Flag         = "MoneySlider",
+    Callback     = function(val) CONFIG.moneyAmount = val * 1000000 end,
+})
+
+-- ══════════════════════════════════════════════════════
+--  TAB 2  ·  MATERIALS
+-- ══════════════════════════════════════════════════════
+local MatTab = Window:CreateTab("🪨  Materials", 4483362458)
+MatTab:CreateSection("Unlimited Materials")
+
+MatTab:CreateToggle({
+    Name         = "Infinite Materials Loop",
+    CurrentValue = false,
+    Flag         = "InfMats",
+    Callback     = function(val)
+        loopFlags.material = val
+        if val then setStat(statMaterial, CONFIG.materialAmount) end
+    end,
+})
+
+MatTab:CreateButton({
+    Name = "Set Materials Once",
+    Callback = function()
+        refreshStats()
+        setStat(statMaterial, CONFIG.materialAmount)
+        Rayfield:Notify({
+            Title   = "Axiom",
+            Content = "Materials → " .. tostring(CONFIG.materialAmount),
+            Duration= 3, Image = 4483362458,
+        })
+    end,
+})
+
+MatTab:CreateSlider({
+    Name         = "Material Amount (millions)",
+    Range        = {1, 999},
+    Increment    = 1,
+    Suffix       = "M",
+    CurrentValue = 999,
+    Flag         = "MatSlider",
+    Callback     = function(val) CONFIG.materialAmount = val * 1000000 end,
+})
+
+-- ══════════════════════════════════════════════════════
+--  TAB 3  ·  NUKES
+-- ══════════════════════════════════════════════════════
+local NukeTab = Window:CreateTab("☢  Nukes", 4483362458)
+NukeTab:CreateSection("Unlimited Nukes")
+
+NukeTab:CreateToggle({
+    Name         = "Infinite Nuke Count Loop",
+    CurrentValue = false,
+    Flag         = "InfNukes",
+    Callback     = function(val)
+        loopFlags.nuke = val
+        if val then setStat(statNuke, CONFIG.nukeAmount) end
+    end,
+})
+
+NukeTab:CreateButton({
+    Name = "Set Nuke Count Once",
+    Callback = function()
+        refreshStats()
+        setStat(statNuke, CONFIG.nukeAmount)
+        Rayfield:Notify({
+            Title   = "Axiom",
+            Content = "Nukes → " .. tostring(CONFIG.nukeAmount),
+            Duration= 3, Image = 4483362458,
+        })
+    end,
+})
+
+NukeTab:CreateSlider({
+    Name         = "Nuke Count",
+    Range        = {1, 9999},
+    Increment    = 1,
+    Suffix       = " nukes",
+    CurrentValue = 9999,
+    Flag         = "NukeSlider",
+    Callback     = function(val) CONFIG.nukeAmount = val end,
+})
+
+NukeTab:CreateSection("Launch Remote")
+
+NukeTab:CreateButton({
+    Name = "Auto-Fire Nuke Remote",
+    Callback = function()
+        local remote = findNukeRemote()
+        if remote then
+            fireRemote(remote)
+            Rayfield:Notify({
+                Title   = "Axiom",
+                Content = "Fired: " .. remote.Name,
+                Duration= 3, Image = 4483362458,
+            })
+        else
+            Rayfield:Notify({
+                Title   = "Axiom",
+                Content = "No nuke remote matched. Use Scanner tab to find the right name.",
+                Duration= 5, Image = 4483362458,
+            })
+        end
+    end,
+})
+
+NukeTab:CreateInput({
+    Name                     = "Manual Remote Name",
+    PlaceholderText          = "paste remote name here",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(val)
+        if val and val ~= "" then
+            local r = ReplicatedStorage:FindFirstChild(val, true)
+                   or workspace:FindFirstChild(val, true)
+            if r then
+                fireRemote(r)
+                Rayfield:Notify({
+                    Title   = "Axiom",
+                    Content = "Fired: " .. val,
+                    Duration= 3, Image = 4483362458,
+                })
+            else
+                Rayfield:Notify({
+                    Title   = "Axiom",
+                    Content = "'" .. val .. "' not found anywhere.",
+                    Duration= 4, Image = 4483362458,
+                })
+            end
+        end
+    end,
+})
+
+-- ══════════════════════════════════════════════════════
+--  TAB 4  ·  SCANNER
+-- ══════════════════════════════════════════════════════
+local ScanTab = Window:CreateTab("🔍  Scanner", 4483362458)
+ScanTab:CreateSection("Stat Detection")
+
+ScanTab:CreateButton({
+    Name = "Scan leaderstats",
+    Callback = function()
+        refreshStats()
+        local ls = lp:FindFirstChild("leaderstats")
+        if not ls then
+            Rayfield:Notify({Title="Axiom", Content="No leaderstats yet — try after spawning.", Duration=4, Image=4483362458})
+            return
+        end
+        local lines = {}
+        for _, obj in ipairs(ls:GetChildren()) do
+            table.insert(lines, obj.Name .. " = " .. tostring(obj.Value))
+        end
+        local out = table.concat(lines, "\n")
+        print("[Axiom — leaderstats]\n" .. out)
+        Rayfield:Notify({
+            Title   = "Axiom — leaderstats",
+            Content = out:sub(1, 250),
+            Duration= 10, Image = 4483362458,
+        })
+    end,
+})
+
+ScanTab:CreateButton({
+    Name = "Dump All RemoteEvents",
+    Callback = function()
+        local out = listAllRemotes()
+        print("[Axiom — Remotes]\n" .. out)
+        Rayfield:Notify({
+            Title   = "Axiom — Remotes",
+            Content = "Printed to console (F9).",
+            Duration= 4, Image = 4483362458,
+        })
+    end,
+})
+
+ScanTab:CreateButton({
+    Name = "Find Nuke Remote",
+    Callback = function()
+        local r = findNukeRemote()
+        local msg = r and ("Found: " .. r.Name .. "\n@ " .. r:GetFullName())
+                     or  "No match. Dump remotes and use manual input."
+        print("[Axiom — Nuke Remote] " .. msg)
+        Rayfield:Notify({Title="Axiom", Content=msg, Duration=6, Image=4483362458})
+    end,
+})
+
+-- ══════════════════════════════════════════════════════
+--  LOAD NOTIFY
+-- ══════════════════════════════════════════════════════
+Rayfield:Notify({
+    Title    = "Axiom loaded  //  Zynova",
+    Content  = "HTTP shim active. Run Scanner → Scan leaderstats first.",
+    Duration = 6,
+    Image    = 4483362458,
+})
